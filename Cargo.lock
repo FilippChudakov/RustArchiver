@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "rust_coding"
+name = "RustArchiver"
 version = "0.1.0"
