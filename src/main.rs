@@ -1,7 +1,7 @@
 use std::fs;
 
 // Basic classes
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum ArchiveError {
     Truncated,
     UnknownMode(u8),
@@ -233,4 +233,56 @@ fn main() -> std::io::Result<()> {
         eprintln!("Usage: main.exe [(de)compress] [input_path] [output_path]")
     }
     Ok(())
+}
+
+
+// Tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn empty_data() {
+        assert_eq!(decompress(&[]), Err(ArchiveError::Truncated));
+    }
+    #[test]
+    fn unknown_mode() {
+        assert_eq!(decompress(&[7, 1, 2]), Err(ArchiveError::UnknownMode(7)));
+    }
+    #[test]
+    fn not_truncated() {
+        let data = b"The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
+        let packed = compress(&data);
+        assert_eq!(decompress(&packed[..10]).err(), Some(ArchiveError::Truncated));
+        assert_eq!(decompress(&packed[..packed.len()/2]).err(), Some(ArchiveError::Corrupted));
+    }
+    #[test]
+    fn corrupted() {
+        let data = b"The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
+        let mut packed = compress(&data);
+        packed[8] ^= 1;
+        assert_eq!(decompress(&packed[..packed.len()]), Err(ArchiveError::Corrupted));
+    }
+    #[test]
+    fn aaaa_text() {
+        let data = &b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(100);
+        let packed = compress(data);
+        assert!(packed.len() < 20);
+        assert!(decompress(&packed).unwrap() == *data);
+    }
+    #[test]
+    fn normal_text() {
+        let data = "The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
+        let packed = compress(data.as_bytes());
+        assert_eq!(decompress(&packed).unwrap(), data.as_bytes());
+    }
+    #[test]
+    fn with_256_bytes() {
+        let mut data: Vec<u8> = Vec::new();
+        for b in 0..=255u8 {
+            data.push(b);
+        }
+        let packed = huffman_compress(&data);
+        assert_eq!(huffman_decompress(&packed).unwrap(), data);
+    }
 }
