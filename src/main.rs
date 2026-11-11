@@ -5,7 +5,8 @@ use std::fs;
 enum ArchiveError {
     Truncated,
     UnknownMode(u8),
-    Corrupted
+    Corrupted,
+    ChecksumMismatch
 }
 enum Node {
     Leaf {byte: u8, freq:usize},
@@ -72,6 +73,21 @@ fn read_u16(data: &[u8], start: usize) -> Result<u16, ArchiveError> {
 fn read_u32(data: &[u8], start: usize) -> Result<u32, ArchiveError> {
     let bytes = data.get(start..start+4).ok_or(ArchiveError::Truncated)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if (crc & 1) == 1 {
+                crc >>= 1;
+                crc ^= 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
 }
 fn pop_min(nodes: &mut Vec<Node>) -> Node {
     let (idx, _) = nodes.iter().enumerate().min_by_key(|(_, n)| n.freq()).unwrap();
@@ -188,6 +204,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     if packed.len() < data.len() {
         out.push(1);
+        out.extend_from_slice(&(crc32(data) as u32).to_le_bytes());
         out.extend_from_slice(&packed);
     } else {
         out.push(0);
@@ -199,7 +216,20 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, ArchiveError> {
     let mode = *data.first().ok_or(ArchiveError::Truncated)?;
     match mode {
         0 => Ok(data[1..].to_vec()),
-        1 => huffman_decompress(&data[1..]),
+        1 => {
+            let crc = read_u32(data, 1).unwrap();
+            let restored = huffman_decompress(&data[5..]);
+            match &restored {
+                Ok(bytes) => {
+                    if crc32(&bytes) != crc {
+                        return Err(ArchiveError::ChecksumMismatch);
+                    }
+                }
+                Err(_) => return restored
+            }
+            
+            return restored;
+        },
         other => Err(ArchiveError::UnknownMode(other))
     }
 }
@@ -243,11 +273,11 @@ mod tests {
     
     #[test]
     fn empty_data() {
-        assert_eq!(decompress(&[]), Err(ArchiveError::Truncated));
+        assert_eq!(decompress(&[]).err(), Some(ArchiveError::Truncated));
     }
     #[test]
     fn unknown_mode() {
-        assert_eq!(decompress(&[7, 1, 2]), Err(ArchiveError::UnknownMode(7)));
+        assert_eq!(decompress(&[7, 1, 2]).err(), Some(ArchiveError::UnknownMode(7)));
     }
     #[test]
     fn not_truncated() {
@@ -261,7 +291,7 @@ mod tests {
         let data = b"The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
         let mut packed = compress(&data);
         packed[8] ^= 1;
-        assert_eq!(decompress(&packed[..packed.len()]), Err(ArchiveError::Corrupted));
+        assert_eq!(decompress(&packed[..packed.len()]).err(), Some(ArchiveError::Corrupted));
     }
     #[test]
     fn aaaa_text() {
@@ -284,5 +314,20 @@ mod tests {
         }
         let packed = huffman_compress(&data);
         assert_eq!(huffman_decompress(&packed).unwrap(), data);
+    }
+    #[test]
+    fn check_sum() {
+        let data = "The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
+        let mut packed = compress(data.as_bytes());
+        packed[11] ^= 1;
+        assert_eq!(decompress(&packed).err(), Some(ArchiveError::ChecksumMismatch));
+    }
+    #[test]
+    fn bit_corrupting() {
+        let data = "The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
+        let mut packed = compress(data.as_bytes());
+        let l = packed.len();
+        packed[l/2] ^= 1;
+        assert!(decompress(&packed).is_err());
     }
 }
