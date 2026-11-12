@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 // Basic classes
 #[derive(Debug, PartialEq)]
@@ -6,7 +6,14 @@ enum ArchiveError {
     Truncated,
     UnknownMode(u8),
     Corrupted,
-    ChecksumMismatch
+    ChecksumMismatch,
+    InvalidName,
+    Io(String)
+}
+impl From<std::io::Error> for ArchiveError {
+    fn from(value: std::io::Error) -> Self {
+        ArchiveError::Io(value.to_string())
+    }
 }
 enum Node {
     Leaf {byte: u8, freq:usize},
@@ -208,6 +215,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&packed);
     } else {
         out.push(0);
+        out.extend_from_slice(&(crc32(data) as u32).to_le_bytes());
         out.extend_from_slice(&data);
     }
     out
@@ -215,28 +223,70 @@ fn compress(data: &[u8]) -> Vec<u8> {
 fn decompress(data: &[u8]) -> Result<Vec<u8>, ArchiveError> {
     let mode = *data.first().ok_or(ArchiveError::Truncated)?;
     match mode {
-        0 => Ok(data[1..].to_vec()),
-        1 => {
-            let crc = read_u32(data, 1).unwrap();
-            let restored = huffman_decompress(&data[5..]);
-            match &restored {
-                Ok(bytes) => {
-                    if crc32(&bytes) != crc {
-                        return Err(ArchiveError::ChecksumMismatch);
-                    }
-                }
-                Err(_) => return restored
+        0 => {
+            let crc = read_u32(data, 1)?;
+            let restored = data[5..].to_vec();
+            if crc32(&restored) != crc {
+                return Err(ArchiveError::ChecksumMismatch);
             }
-            
-            return restored;
+            Ok(restored)
+        },
+        1 => {
+            let crc = read_u32(data, 1)?;
+            let restored = huffman_decompress(&data[5..])?;
+            if crc32(&restored) != crc {
+                return Err(ArchiveError::ChecksumMismatch);
+            }
+            Ok(restored)
         },
         other => Err(ArchiveError::UnknownMode(other))
     }
 }
+
+fn pack(files: &[String]) -> Result<Vec<u8>, ArchiveError> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for file in files {
+        let path = Path::new(file);
+        let name = path.file_name().ok_or(ArchiveError::InvalidName)?.to_string_lossy().to_string();
+        let data = fs::read(path)?;
+        let packed = compress(&data);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&name.as_bytes());
+        out.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&packed);
+    }
+    Ok(out)
+}
+fn unpack(archive_path: &String, out_dir: &String) -> Result<usize, ArchiveError>{
+    let data = &fs::read(archive_path)?;
+    let count = read_u32(data, 0)?;
+    let mut cursor: usize = 4;
+    let out_dir = Path::new(out_dir);
+    fs::create_dir_all(out_dir)?;
+
+    for _ in 0..count {
+        let name_len = read_u16(data, cursor)? as usize;
+        cursor += 2;
+        let name_bytes = data.get(cursor..cursor + name_len).ok_or(ArchiveError::Truncated)?;
+        cursor += name_len;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| ArchiveError::InvalidName)?;
+        let safe_name = Path::new(name).file_name().ok_or(ArchiveError::Truncated)?;
+
+        let file_len = read_u32(data, cursor)? as usize;
+        cursor += 4;
+        let file_data = data.get(cursor..cursor + file_len).ok_or(ArchiveError::Truncated)?;
+        cursor += file_len;
+
+        fs::write(Path::new(out_dir).join(safe_name), decompress(file_data)?)?;
+    }
+    Ok(count as usize)
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() == 4 {
+    if args.len() >= 4 {
         match args[1].as_str() {
             "compress" => {
                 let data = fs::read(&args[2])?;
@@ -257,10 +307,29 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
-            _ => eprintln!("Usage: main.exe [(de)compress] [input_path] [output_path]")
+            "pack" => {
+                match pack(&args[3..]) {
+                    Ok(packed) => {
+                        fs::write(&args[2], &packed)?;
+                    },
+                    Err(e) => {
+                        eprintln!("Error: {:?}", e)
+                    }
+                }
+            },
+            "unpack" => {
+                match unpack(&args[2], &args[3]) {
+                    Ok(n) => println!("Files unpacked: {}", n),
+                    Err(e) => {
+                        eprintln!("Error: {:?}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => eprintln!("Usage: main.exe [(de)compress]/[(un)pack] ([input_path] [output_path])/([paths])")
         }
     } else {
-        eprintln!("Usage: main.exe [(de)compress] [input_path] [output_path]")
+        eprintln!("Usage: main.exe [(de)compress]/[(un)pack] ([input_path] [output_path])/([paths])")
     }
     Ok(())
 }
@@ -273,6 +342,7 @@ mod tests {
     
     #[test]
     fn empty_data() {
+        assert_eq!(decompress(&compress(&[])).unwrap(), []);
         assert_eq!(decompress(&[]).err(), Some(ArchiveError::Truncated));
     }
     #[test]
@@ -280,7 +350,7 @@ mod tests {
         assert_eq!(decompress(&[7, 1, 2]).err(), Some(ArchiveError::UnknownMode(7)));
     }
     #[test]
-    fn not_truncated() {
+    fn trunc_corrupt() {
         let data = b"The Bayeux Tapestry (also known in France as a Tapestry of Queen Matilda)".repeat(100);
         let packed = compress(&data);
         assert_eq!(decompress(&packed[..10]).err(), Some(ArchiveError::Truncated));
@@ -329,5 +399,10 @@ mod tests {
         let l = packed.len();
         packed[l/2] ^= 1;
         assert!(decompress(&packed).is_err());
+    }
+    #[test]
+    fn crc_check() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
     }
 }
